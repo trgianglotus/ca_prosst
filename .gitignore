@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Generated artifacts — regenerable, often large
+data/
+outputs/
+*.npy
+*.pt
+*.safetensors
+wandb/

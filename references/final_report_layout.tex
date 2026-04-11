@@ -1,0 +1,127 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\setstretch{1.05}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\title{Confidence-Aware ProSST: Improving Robustness of Structure-Aware Protein Language Models Under Structural Uncertainty}
+\author{
+    Member 1 (NTU Email) \and
+    Member 2 (NTU Email) \and
+    Member 3 (NTU Email)
+}
+\date{AI6127 Final Project Report}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project studies robust protein language modeling under structural uncertainty. We extend ProSST with confidence-aware sequence-structure integration using residue-level confidence signals (for example pLDDT). We compare hard masking, soft weighting, and learned gating strategies in disentangled attention. On ProteinGym, our best variant aims to improve robustness in low-confidence structure regimes while maintaining competitive overall performance against ProSST baselines. These results suggest that uncertainty-aware structure fusion is important for practical deployment of structure-aware protein language models.
+\end{abstract}
+
+\section{Introduction}
+\subsection{Problem and Motivation}
+Protein language models can benefit from structure signals, but predicted structures have non-uniform quality across proteins and residues. This report explores how to integrate confidence signals so the model trusts structure when reliable and relies more on sequence when uncertain.
+
+\subsection{Challenges}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Data quality}: Structural confidence varies by residue.
+    \item \textbf{Modeling}: Sequence-structure fusion should be confidence-aware.
+\end{itemize}
+
+\subsection{Contributions}
+\begin{itemize}[leftmargin=*]
+    \item A confidence-aware extension of ProSST.
+    \item Three variants: hard masking, soft weighting, learned gating.
+    \item Stratified robustness analysis by confidence bins.
+\end{itemize}
+
+\section{Related Work / Background}
+\subsection{Protein Language Models}
+Briefly review sequence-only and structure-aware PLMs (for example ESM, SaProt, ProSST), and discuss their assumptions.
+
+\subsection{Confidence and Uncertainty}
+Summarize reliability-aware modeling ideas and motivate confidence-guided attention.
+
+\subsection{Positioning}
+Explain how this work differs from ProSST and why confidence-aware fusion is a practical extension.
+
+\section{Approach}
+\subsection{Baseline: ProSST}
+Describe structure tokenization and sequence-structure disentangled attention.
+
+\subsection{Proposed Method: CA-ProSST}
+\textbf{V1 Hard Masking:} mask low-confidence structure tokens. \\
+\textbf{V2 Soft Weighting:} scale structure-related attention by confidence. \\
+\textbf{V3 Learned Gate:} learn a gate per residue to balance sequence and structure contributions.
+
+\subsection{Implementation Details}
+State architecture changes, confidence feature design, and training details.
+
+\section{Experiments}
+\subsection{Data}
+Describe datasets, references, and exact task input/output format.
+
+\subsection{Evaluation Metrics}
+Define primary and secondary metrics (for example Spearman, NDCG, Top-recall).
+
+\subsection{Experimental Settings}
+Report hardware, optimizer, learning rate, batch size, training steps, and random seed policy.
+
+\subsection{Baselines}
+Include ProSST, sequence-only ablations, and optional external baselines.
+
+\subsection{Main Results}
+\begin{table}[h]
+\centering
+\caption{Overall performance placeholder}
+\begin{tabular}{lccc}
+\toprule
+Model & Spearman & NDCG & Top-recall \\
+\midrule
+ProSST baseline & -- & -- & -- \\
+CA-ProSST V1 & -- & -- & -- \\
+CA-ProSST V2 & -- & -- & -- \\
+CA-ProSST V3 & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablations and Robustness}
+Report component ablations and confidence-stratified performance.
+
+\subsection{Result Commentary}
+Comment on whether outcomes match expectations, and explain why.
+
+\section{Analysis}
+Include qualitative analysis: success cases, failure cases, and model behavior.
+
+\section{Conclusion}
+Summarize findings, lessons learned, limitations, and future work.
+
+\section*{Team Contributions}
+\begin{itemize}[leftmargin=*]
+    \item Member 1 (xx\%): 1--2 sentence contribution summary.
+    \item Member 2 (xx\%): 1--2 sentence contribution summary.
+    \item Member 3 (xx\%): 1--2 sentence contribution summary.
+\end{itemize}
+
+\section*{References}
+Add all cited references here.
+
+\appendix
+\section{Optional Appendix}
+Extra tables, figures, examples, and implementation details can be added here.
+
+\end{document}
