@@ -6,11 +6,12 @@ passed unchanged into every disentangled-attention layer (aa2ss / ss2aa terms).
 Scaling or masking ss_hidden_states before the encoder call applies the CA
 signal uniformly to all layers without touching attention internals.
 
-Three variants, selected by `config.ca_mode`:
+Four variants, selected by `config.ca_mode`:
     - "none": pass-through, equivalent to vanilla ProSST
     - "hard": zero ss embeddings for residues with pLDDT < ca_threshold
     - "soft": multiply ss embeddings by (pLDDT / 100)
     - "gate": learned per-residue sigmoid gate over [aa_embedding, conf]
+    - "zero": zero all ss embeddings (sequence-only ablation; no pLDDT needed)
 
 pLDDT input convention:
     Tensor of shape [B, L] in the 0..100 range, aligned to input_ids *including*
@@ -93,6 +94,8 @@ class CAProSSTForMaskedLM(ProSSTForMaskedLM):
         aa_embeddings: torch.Tensor,
         plddt: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if self.ca_mode == "zero":
+            return torch.zeros_like(ss_embeddings)
         if plddt is None or self.ca_mode == "none":
             return ss_embeddings
         conf = torch.clamp(plddt.to(ss_embeddings.dtype) / 100.0, 0.0, 1.0)

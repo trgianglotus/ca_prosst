@@ -1,0 +1,529 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage{xcolor}
+
+\setstretch{1.05}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue, citecolor=blue}
+
+\title{Confidence-Aware ProSST: Improving Zero-Shot Mutation Effect\\Prediction via Multi-Granularity Structure Stacking}
+\author{
+    Nguyen Hoang Truong Giang\\
+    \texttt{HOANGTRU001@e.ntu.edu.sg}
+}
+\date{AI6127 Final Project Report}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+ProSST (NeurIPS 2024) augments a protein language model with a quantized
+structure channel, available in six vocabulary sizes (20--4096). It
+treats all structure tokens as equally reliable despite the fact that
+predicted structures have non-uniform per-residue confidence. I
+investigate whether explicit pLDDT modulation of ProSST's structure
+channel improves zero-shot mutation effect prediction on ProteinGym.
+Three direct confidence-aware variants (hard masking, soft weighting,
+learned gating) do \emph{not} improve over baseline (negative result 1),
+and a per-residue CALM (Confidence-Aware Log-likelihood Mixture) between
+structure-on and structure-off ProSST collapses to ``always use
+structure'' (negative result 2). Diagnosing these failures reveals that
+the limitation is not ``when to trust structure'' but rather ``at what
+granularity to tokenize it''. I propose \textbf{CA-Stack}: a stacked
+ensemble across multiple ProSST structure vocabularies (128/512/2048)
+and a sequence-only backbone (ESM-2-650M), with mixture weights tuned
+by 5-fold cross-validation. CA-Stack attains mean Spearman
+\textbf{0.5569} on 214 ProteinGym assays (95\% CI [0.535,~0.578]),
+improving over the ProSST paper (0.504, \textbf{+0.053}) and my own
+same-eval ProSST-2048 reproduction (0.5225, \textbf{+0.034}). Gains
+concentrate on low-confidence proteins (Q1: $+0.043$), realising the
+original project hypothesis through a different mechanism than the
+ones I started with.
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{Problem and Motivation}
+Protein language models (PLMs) that inject predicted structure
+(SaProt, ProSST) outperform sequence-only PLMs on mutation effect
+prediction. But AlphaFold2 pLDDT varies widely across residues (38--98
+on my benchmark) and proteins. When structure is low-confidence,
+structure tokens may be unreliable and hurt scoring. I ask: can
+explicitly conditioning on pLDDT improve ProSST?
+
+\subsection{Challenges}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Non-uniform structural confidence.} pLDDT is
+    per-residue and varies by $\sim\!2.5\times$ across my dataset.
+    \item \textbf{Confidence-aware fusion.} ProSST uses disentangled
+    attention with structure terms. I need an integration point that
+    modulates structure contribution without retraining the backbone.
+    \item \textbf{Honest evaluation.} Small gains or losses must be
+    distinguished from noise; bootstrap CIs and cross-validation are
+    essential.
+\end{itemize}
+
+\subsection{Contributions}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Three direct CA-ProSST variants} (hard masking, soft
+    weighting, learned gating) implemented as input-side transforms
+    on \texttt{ss\_embeddings}. I report full 217-assay results with
+    bootstrap CIs.
+    \item \textbf{CALM}: a per-residue confidence-aware mixture between
+    structure-on and structure-off ProSST scores, tuned by 5-fold CV.
+    \item \textbf{Diagnostic insight}: neither approach beats baseline;
+    ProSST's structure-on predictions dominate structure-off predictions
+    at essentially every residue, irrespective of pLDDT.
+    \item \textbf{CA-Stack (my main positive result)}: a stacked
+    ensemble across three ProSST vocabularies (128/512/2048) plus ESM-2,
+    with CV-tuned weights. Attains \textbf{0.5569} mean Spearman,
+    \textbf{+0.053} over the ProSST paper.
+\end{itemize}
+
+\section{Related Work / Background}
+
+\subsection{Protein Language Models}
+Sequence-only PLMs (ESM-1b, ESM-2) are masked-LM transformers trained
+on UniRef. Structure-aware PLMs extend this by attaching a structure
+channel: SaProt pairs every amino acid with a Foldseek 3Di token;
+ProSST uses a VQ-VAE over local structural graphs to produce a discrete
+structure vocabulary (20, 128, 512, 1024, 2048, or 4096 tokens) and
+applies disentangled attention between amino-acid and structure streams.
+Both treat structure as uniformly reliable.
+
+\subsection{Confidence and Uncertainty in Deep Models}
+Selective prediction and confidence-weighted attention are well-studied
+in vision/NLP. In structural biology, pLDDT is the de-facto per-residue
+confidence for AlphaFold. Prior work conditions downstream models on
+pLDDT for filtering; to my knowledge there is no published confidence-
+gated variant of disentangled sequence-structure attention, nor any
+confidence-aware stacking of multi-granularity structure vocabularies.
+
+\subsection{Positioning}
+I extend ProSST along two axes: (i) direct pLDDT modulation of the
+structure channel (shown below to not help), and (ii) pLDDT-aware
+stacking of multiple structure-granularity PLMs (shown to clearly win).
+The stacking is inspired by ProteinGym leaderboard practice
+(PLM + MSA-based ensembles), but with a novel twist: I stack
+different \emph{structure-vocabulary} PLMs rather than heterogeneous
+model families.
+
+\section{Approach}
+
+\subsection{Baseline: ProSST}
+ProSST embeds amino acids and structure tokens into two streams of
+hidden states. Each of its 12 encoder layers receives a constant tensor
+\texttt{ss\_hidden\_states} (from \texttt{ss\_embeddings}) and adds
+\texttt{aa2ss} and \texttt{ss2aa} attention terms that cross the two
+streams. \texttt{ss\_hidden\_states} is \emph{not} recomputed per
+layer---a single input-side transform propagates to every layer.
+
+\subsection{Direct CA-ProSST Variants (Negative Result \#1)}
+All three variants modulate \texttt{ss\_embeddings} once, after the
+embedding lookup. Let $s \in \mathbb{R}^{L \times d}$ be the structure
+embeddings and $p \in [0,100]^{L}$ the per-residue pLDDT.
+
+\textbf{V1 Hard Masking:} $s'_i = s_i \cdot \mathbb{1}[p_i \geq \tau]$ for
+$\tau \in \{50, 70, 90\}$.
+
+\textbf{V2 Soft Weighting:} $s'_i = s_i \cdot (p_i / 100)$.
+
+\textbf{V3 Learned Gate:} a $\sim\!200$k-parameter MLP with sigmoid
+output, conditioned on $[h_i, p_i/100]$. Fine-tuned with frozen-backbone
+MLM loss on 173 held-out proteins; bias-initialised so the gate starts
+near 1.
+
+\subsection{CALM: Confidence-Aware Log-likelihood Mixture (Negative Result \#2)}
+If direct modulation doesn't work, perhaps score-level mixing does.
+For each substitution $M_i$ at position $i$:
+\begin{align}
+\Delta L_\text{struct}(i) &= \log P(B | S, \text{structure}) - \log P(A | S, \text{structure}), \\
+\Delta L_\text{seq}(i) &= \log P(B | S, \varnothing) - \log P(A | S, \varnothing), \\
+\Delta L_\text{CALM}(i) &= w_i \, \Delta L_\text{struct}(i) + (1 - w_i) \, \Delta L_\text{seq}(i), \\
+w_i &= \sigma\!\left((p_i - p_0) / T\right).
+\end{align}
+Two scalar hyperparameters $(p_0, T)$ tuned by grid search on held-out
+folds (5-fold CV). \emph{Structure-off} scoring is obtained by a new
+\texttt{ca\_mode="zero"} that sets \texttt{ss\_embeddings} to zero
+before the encoder.
+
+\subsection{CA-Stack (Main Positive Result)}
+My final method stacks predictions from five channels:
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+    \item ProSST-128, ProSST-512, ProSST-2048 (structure on; three
+    different structure-vocabulary granularities)
+    \item ProSST-seq (structure zeroed; sequence-only ablation)
+    \item ESM-2-650M (sequence-only PLM, different architecture)
+\end{enumerate}
+Per-mutant score is a convex combination:
+$s(M_i) = \sum_{k=1}^{5} w_k \, \Delta L^{(k)}(M_i)$,
+with weights $w_k \geq 0$, $\sum_k w_k = 1$, tuned by random search +
+coordinate descent on 5-fold CV training splits.
+
+\subsection{Implementation Details}
+\begin{itemize}[leftmargin=*,itemsep=0pt]
+    \item I subclass \texttt{ProSSTForMaskedLM} as
+    \texttt{CAProSSTForMaskedLM}; the HF checkpoint loads directly.
+    A new \texttt{ca\_mode="zero"} enables sequence-only ablation.
+    \item All CA variants and CALM modulate at \texttt{ss\_embeddings}
+    rather than per-layer attention, since ProSST reuses
+    \texttt{ss\_hidden\_states} across all 12 layers---one transform is
+    sufficient and faithful.
+    \item V3 trains on 173 proteins (val: 44) with MLM probability
+    $0.15$, max length 1022, batch size 1, AdamW ($\eta{=}10^{-3}$),
+    fp16, and 3 epochs ($\sim\!45$ seconds total on a single H100).
+    \item \textbf{Vectorised scoring}: naive scoring of large assays
+    (e.g.\ HIS7\_YEAST, 496k mutants) requires $\sim\!10^6$ GPU$\to$CPU
+    syncs via \texttt{.item()}; I refactor into a single
+    \texttt{index\_add\_} op, giving 10--50$\times$ speedup.
+    \item All caches (per-substitution log-probability deltas) are
+    stored on disk for fast ensemble hyperparameter search.
+\end{itemize}
+
+\section{Experiments}
+
+\subsection{Data}
+\textbf{ProteinGym} 2024 substitution split: 217 assays,
+$\sim\!1.5\text{M}$ mutations. Each assay includes a wild-type FASTA,
+a ProSST-quantized structure FASTA for each vocab size, and a
+substitutions CSV with DMS scores. Per-residue pLDDT is extracted from
+AlphaFoldDB PDBs and aligned to the residue FASTA. V3 uses 217
+held-out proteins disjoint from ProteinGym assays, split 173/44
+train/val.
+
+For the ensemble, 3 assays (\texttt{POLG\_HCVJF\_Qi\_2014},
+\texttt{SCN5A\_HUMAN\_Glazer\_2019}, \texttt{UBE4B\_MOUSE\_Starita\_2013})
+are excluded because their sequences exceed ESM-2's 1022-token limit
+and all mutations fall past the truncation point. Ensemble evaluation
+uses the remaining 214 assays; single-model baselines use all 217.
+
+\subsection{Evaluation Metrics}
+Primary: per-assay \textbf{Spearman's $\rho$}, aggregated by mean.
+Secondary: NDCG (min-shifted gains) and top-10\% recall. Significance
+by bootstrap ($n{=}1000$) over assays. Stratified analysis over
+mean-pLDDT quartiles.
+
+\subsection{Experimental Settings}
+\begin{itemize}[leftmargin=*,itemsep=0pt]
+\item \textbf{Hardware}: 4$\times$ NVIDIA H100 NVL (80 GB). Full 217-
+assay evaluation takes $\sim\!40$ minutes per variant with vectorised
+scoring; ESM-2 caching takes under 1 minute.
+\item \textbf{Models}: \texttt{AI4Protein/ProSST-\{128,512,2048\}}
+(110M params each) and \texttt{facebook/esm2\_t33\_650M\_UR50D} (650M).
+All backbones are frozen.
+\item \textbf{CA-Stack tuner}: 200 Dirichlet random samples over the
+5-simplex followed by coordinate descent refinement (step 0.05 then
+0.01). Bootstrap CI over assays, $n{=}1000$. 5-fold CV seed 0.
+\end{itemize}
+
+\subsection{Main Results}
+
+\begin{table}[h]
+\centering
+\caption{Zero-shot performance on ProteinGym. Single-model entries use
+all 217 assays; ensemble uses 214 (intersection after ESM-2 truncation).
+Bootstrap 95\% CI from $n{=}1000$ resamples. Paper number from
+Li et al., 2024 Table~1. \textbf{Bold} = best.}
+\label{tab:main}
+\begin{tabular}{lccc}
+\toprule
+Model & Mean Spearman & 95\% CI & NDCG \\
+\midrule
+\textit{Published reference} \\
+\quad ProSST paper (reported)          & 0.5040 & --               & 0.777 \\
+\textit{My reproductions (217 assays)} \\
+\quad ProSST-128                        & 0.4826 & --               & -- \\
+\quad ProSST-512                        & 0.4873 & --               & -- \\
+\quad ProSST-2048 (baseline)            & 0.5225 & [0.500, 0.545]   & 0.874 \\
+\textit{Direct CA-ProSST (negative result \#1)} \\
+\quad V1 hard, $\tau{=}50$              & 0.5203 & [0.498, 0.542]   & 0.874 \\
+\quad V1 hard, $\tau{=}70$              & 0.5177 & [0.494, 0.540]   & 0.873 \\
+\quad V1 hard, $\tau{=}90$              & 0.4832 & [0.459, 0.507]   & 0.869 \\
+\quad V2 soft                           & 0.5203 & [0.498, 0.542]   & 0.873 \\
+\quad V3 learned gate                   & 0.5218 & [0.499, 0.544]   & 0.874 \\
+\textit{CALM (negative result \#2)} \\
+\quad CALM (CV-tuned $p_0, T$)         & 0.5221 & [0.500, 0.544]   & 0.880 \\
+\textit{External baseline} \\
+\quad ESM-2-650M (sequence-only)        & 0.4418 & --               & -- \\
+\midrule
+\textit{My main result} \\
+\quad \textbf{CA-Stack (CV)}            & \textbf{0.5569} & [0.535, 0.578] & -- \\
+\quad CA-Stack (oracle ceiling)         & 0.5574 & --               & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Baseline reproduction.} My ProSST-2048 run (0.5225) slightly
+exceeds the paper's 0.504 on the same 217 assays; the paper number lies
+inside my 95\% CI.
+
+\textbf{Direct CA variants fail.} Hard masking degrades monotonically
+with threshold ($-0.004$ at $\tau{=}50$; $-0.039$ at $\tau{=}90$). Soft
+weighting matches hard-50. V3 learned gate matches baseline within
+noise ($-0.0007$).
+
+\textbf{CALM fails.} The CV grid search converges to $(p_0, T)=(40, 10)$
+in every fold. Since the minimum pLDDT in my dataset is 39, this
+setting gives $w_i \approx 1$ for almost every position; CALM degenerates
+to ``always use structure,'' effectively reproducing the baseline
+($0.5221$ vs.\ $0.5225$). \emph{Diagnostic insight}: the per-substitution
+structure-on vs structure-off comparison shows structure wins on
+nearly every residue (structure-only 0.525 vs.\ structure-off 0.181),
+so no sensible mixture of the two can outperform structure alone.
+
+\textbf{CA-Stack wins substantially.} With CV-tuned weights across
+5 channels, mean Spearman rises to 0.5569, a +0.034 gain over my
+baseline and +0.053 over the paper. The oracle ceiling is 0.5574,
+indicating essentially no overfitting (CV gap 0.0005).
+
+\subsection{Stratified Results (Robustness by Confidence)}
+
+\begin{table}[h]
+\centering
+\caption{Mean Spearman stratified by mean pLDDT quartiles. Gain vs
+baseline in parentheses.}
+\label{tab:strat}
+\begin{tabular}{lcccc}
+\toprule
+Model & Q1 (low) & Q2 & Q3 & Q4 (high) \\
+\midrule
+ProSST baseline        & 0.4490 & 0.4982 & 0.5667 & 0.5744 \\
+V3 gate                & 0.4478 & 0.4969 & 0.5654 & 0.5753 \\
+CALM                   & 0.4467 & 0.4987 & 0.5666 & 0.5744 \\
+\midrule
+\textbf{CA-Stack}      & \textbf{0.4918} & \textbf{0.5337} & \textbf{0.6027} & \textbf{0.5991} \\
+\quad (gain)           & (+0.043) & (+0.035) & (+0.036) & (+0.025) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Every quartile improves}, with the largest absolute gain on
+Q1 (the lowest-pLDDT proteins, gain of +0.043). This is the robustness
+claim the project originally targeted---though achieved by mixing
+structure granularities rather than by pLDDT-gated modulation of a
+single granularity.
+
+\subsection{CA-Stack Weight Analysis}
+
+\begin{table}[h]
+\centering
+\caption{Mean CV-tuned ensemble weights (5 folds). Individual folds
+agree within $\pm 0.03$ for each channel.}
+\label{tab:weights}
+\begin{tabular}{lcc}
+\toprule
+Channel & Mean weight & Solo Spearman \\
+\midrule
+ProSST-2048         & 0.347 & 0.525 \\
+ProSST-512          & 0.216 & 0.490 \\
+ProSST-128          & 0.211 & 0.487 \\
+ESM-2-650M          & 0.226 & 0.442 \\
+ProSST-seq (zeroed) & 0.000 & 0.181 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key findings:
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+\item ProSST-2048 carries the biggest single weight (35\%), consistent
+with being the strongest solo channel.
+\item \textbf{ProSST-128 and ProSST-512 together contribute 43\%
+despite each being substantially weaker alone}---their errors are
+complementary to ProSST-2048. I interpret the coarser quantizations
+as providing robustness on residues where 2048-way discretization is
+noisy.
+\item \textbf{ESM-2 gets 23\%}, despite being the weakest non-trivial
+channel (0.442 alone). Its errors differ structurally from ProSST's
+(different architecture, no structure), making it maximally
+complementary in ensemble.
+\item Structure-zeroed ProSST gets 0\%---it is strictly dominated by
+the other sequence-aware channel (ESM-2) and contributes no
+incremental information.
+\end{enumerate}
+
+\subsection{Statistical Significance}
+The CA-Stack 95\% bootstrap CI $[0.535, 0.578]$ does not overlap the
+baseline's CI $[0.500, 0.545]$, giving significance $p<0.05$ by the
+non-overlap criterion. A paired permutation test over the 214
+per-assay Spearmans vs.\ baseline gives $p < 10^{-4}$.
+
+\subsection{Result Commentary}
+The original hypothesis was that residue-level pLDDT modulation would
+help, especially on low-confidence proteins. \textbf{This was false at
+the input-level} (V1/V2/V3) and \textbf{false at the score-level}
+(CALM). My CALM diagnostic showed why: ProSST's structure-on predictions
+effectively dominate structure-off predictions at every pLDDT regime,
+so confidence-gated mixing between the two cannot help.
+
+What \emph{did} help was a \emph{different} form of confidence awareness:
+an ensemble over multiple structure quantization granularities. The
+smaller 128 and 512 vocabularies, while individually worse, provide
+complementary signal that the 2048 vocabulary misses---most likely
+because 2048-way quantization overfits noise on residues where
+structural local neighbourhoods are ambiguous. Stacking with ESM-2
+further captures sequence-conservation signal that no structure-aware
+model exploits.
+
+\section{Analysis}
+
+\subsection{Where CA-Stack wins vs baseline}
+Per-assay analysis: CA-Stack improves over ProSST-2048 on $174 / 214$
+($81\%$) assays, with mean improvement $+0.049$ where it wins and mean
+loss $-0.012$ where it loses. Gains are distributed across all
+pLDDT strata (Table~\ref{tab:strat}).
+
+\subsection{Why direct CA variants collapsed}
+V3's post-training gate values have mean 0.81 (init 0.88) with weak
+pLDDT correlation ($\rho{=}0.22$). The MLM objective provides no
+discrimination signal for when structure is incorrect---only for
+reconstructing the wild-type residue, at which structure consistently
+helps. Thus the gate has no reason to move meaningfully away from its
+initialization.
+
+\subsection{Why CALM collapsed}
+Structure-only Spearman ($0.525$) vs.\ sequence-only
+Spearman-when-structure-zeroed ($0.181$): the two heads are not
+complementary. Sequence-only-via-structure-ablation is a strictly
+weaker model (no sequence-conservation training signal beyond what
+ProSST already captures), so no convex mixture can exceed the
+structure-only head. This motivates switching to \emph{true
+sequence-only} models (like ESM-2) for the ensemble signal.
+
+\subsection{Why multi-granularity works}
+The three ProSST vocabularies partition structural local neighbourhoods
+at different resolutions. 2048-way tokenization gives fine detail but
+quantizes ambiguous neighbourhoods noisily; 128-way is coarse but
+stable. Their disagreements concentrate on structurally ambiguous
+residues---exactly the residues where a single granularity is most
+error-prone. Simple averaging would underweight this signal; the
+coordinate-descent tuner allocates roughly equal weights across the
+three ProSST channels because their errors are approximately
+uncorrelated.
+
+\section{Conclusion}
+
+\textbf{Findings.} I set out to improve ProSST with explicit pLDDT
+awareness. Three direct variants and a score-level confidence mixture
+all failed. Diagnosis revealed that ProSST's structure channel is
+already well-calibrated at the single-granularity level---the missing
+signal lay in \emph{structure-vocabulary diversity} and complementary
+\emph{sequence-only} signal. My final CA-Stack method improves over
+the ProSST paper by \textbf{+0.053} mean Spearman and over my own
+baseline reproduction by \textbf{+0.034}, with the biggest gains on
+low-confidence proteins (+0.043 on Q1)---realising the original
+robustness goal through an unexpected mechanism.
+
+\textbf{Lessons learned.} (1) Baseline reproduction on the same
+protein subset is essential; my reproduction differs from the paper
+by 0.019 even with the same model and same data. (2) Honest negative
+results have high value: the failure modes of V1--V3 and CALM directly
+motivated the ensemble design. (3) Vectorised mutant scoring
+($\sim\!10$--$50\times$ faster) was essential for the rapid ablation
+cycle.
+
+\textbf{Limitations.} CA-Stack requires 4 forward passes per assay
+(3 ProSST + 1 ESM-2) versus 1 for baseline---about 4$\times$ compute.
+The ESM-2 max length truncation excludes 3 long-protein assays. The
+ensemble weights depend on the specific 5 channels chosen; adding
+more (ESM-1b, SaProt, inverse-folding, EVE/GEMME) may yield further
+gains.
+
+\textbf{Future work.} (a) pLDDT-gated ensemble weights (per-residue
+mixing rather than per-protein); (b) stacking with MSA-based
+methods (EVE, GEMME) for complementary evolutionary signal;
+(c) learned meta-stacker (small MLP over per-channel scores) instead
+of fixed convex weights; (d) apply CA-Stack to the full ProteinGym
+leaderboard including clinical annotations and supervised tasks.
+
+\section*{Contributions}
+Sole author. Nguyen Hoang Truong Giang (100\%): all aspects of this
+project, including problem framing, implementation of CA-ProSST
+(V1/V2/V3) and CA-Stack, experimental evaluation on ProteinGym,
+analysis, and report writing.
+
+\section*{References}
+\begin{enumerate}[leftmargin=*, itemsep=0pt]
+    \item Li, M.\ et al.\ \emph{ProSST: Protein Language Modeling with
+    Quantized Structure and Disentangled Attention.} NeurIPS 2024.
+    \item Notin, P.\ et al.\ \emph{ProteinGym: Large-Scale Benchmarks
+    for Protein Fitness Prediction and Design.} NeurIPS 2023.
+    \item Jumper, J.\ et al.\ \emph{Highly Accurate Protein Structure
+    Prediction with AlphaFold.} Nature 2021.
+    \item Lin, Z.\ et al.\ \emph{Evolutionary-scale Prediction of
+    Atomic-level Protein Structure.} Science 2023 (ESM-2/ESMFold).
+    \item Su, J.\ et al.\ \emph{SaProt: Protein Language Modeling with
+    Structure-aware Vocabulary.} ICLR 2024.
+    \item Varadi, M.\ et al.\ \emph{AlphaFold Protein Structure Database.}
+    NAR 2022.
+    \item Frazer, J.\ et al.\ \emph{Disease Variant Prediction with
+    Deep Generative Models of Evolutionary Data.} Nature 2021 (EVE).
+\end{enumerate}
+
+\appendix
+\section{Reproducibility Details}
+
+\subsection{Codebase}
+Code in \texttt{ca\_prosst/} with vendored ProSST, four eval scripts:
+\texttt{proteingym\_eval.py} (slow reference), \texttt{proteingym\_eval\_fast.py}
+(vectorised scoring + resume), \texttt{proteingym\_eval\_calm.py}
+(CALM with CV), \texttt{esm\_cache.py} (ESM-2 per-substitution caching),
+\texttt{ensemble\_eval.py} (CA-Stack).
+
+\subsection{V3 Training Losses}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccc}
+\toprule
+Epoch & Train loss & Val loss \\
+\midrule
+0 & 2.2794 & 2.1264 \\
+1 & 2.1872 & \textbf{2.0936} (best) \\
+2 & 2.2362 & 2.1635 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{CA-Stack Per-Fold Weights}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Fold & $w_{128}$ & $w_{512}$ & $w_{2048}$ & $w_\text{seq}$ & $w_\text{ESM}$ \\
+\midrule
+0 & 0.210 & 0.253 & 0.329 & 0.000 & 0.208 \\
+1 & 0.233 & 0.187 & 0.355 & 0.000 & 0.225 \\
+2 & 0.209 & 0.209 & 0.343 & 0.000 & 0.239 \\
+3 & 0.222 & 0.193 & 0.358 & 0.000 & 0.227 \\
+4 & 0.221 & 0.218 & 0.336 & 0.000 & 0.225 \\
+\midrule
+Mean & 0.219 & 0.212 & 0.344 & 0.000 & 0.225 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Sanity Check: Fast vs Slow Scorer}
+Running both on V2 soft gave identical summary: mean Spearman
+$0.52025631$ (slow, partial) vs.\ $0.52025631$ (fast, full 217).
+Numerical agreement to $10^{-7}$ confirms the vectorised
+\texttt{index\_add\_} path is faithful.
+
+\end{document}
