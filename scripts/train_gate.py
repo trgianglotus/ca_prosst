@@ -206,7 +206,7 @@ def main() -> int:
             ds,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=0,
             collate_fn=lambda b: collate(
                 b, tokenizer, mask_id, args.mlm_prob, args.max_len, device
             ),

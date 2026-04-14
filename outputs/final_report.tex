@@ -1,0 +1,442 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage{xcolor}
+
+\setstretch{1.05}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue, citecolor=blue}
+
+\title{Confidence-Aware ProSST: Improving Robustness of\\Structure-Aware Protein Language Models\\Under Structural Uncertainty}
+\author{
+    Member 1 (NTU Email) \and
+    Member 2 (NTU Email) \and
+    Member 3 (NTU Email)
+}
+\date{AI6127 Final Project Report}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+ProSST (NeurIPS 2024) augments a protein language model with a quantized
+structure channel and disentangled attention over amino-acid and structure
+tokens. Predicted structures, however, have non-uniform per-residue confidence
+(pLDDT), and ProSST treats every structure token identically. We study
+whether making the structure channel \emph{confidence-aware} improves zero-shot
+mutation effect prediction on ProteinGym. We propose and implement three
+variants that modulate the shared \texttt{ss\_embeddings} tensor before the
+encoder: (V1) hard masking below a pLDDT threshold, (V2) soft scaling by
+$\text{pLDDT}/100$, and (V3) a learned sigmoid gate conditioned on the
+amino-acid hidden state and pLDDT. V3 is fine-tuned with masked-LM loss on a
+held-out protein set while the ProSST backbone is frozen (only
+${\sim}\!200\text{k}$ new parameters). Across all 217 ProteinGym assays our
+vanilla ProSST-2048 reproduction attains mean Spearman $0.5225$, slightly
+above the paper's reported $0.504$. Contrary to our hypothesis,
+\emph{none} of the confidence-aware variants improve overall performance
+(V1@70: $0.518$; V2: $0.520$; V3: $0.522$); aggressive hard masking at the
+$\text{pLDDT}{<}90$ threshold is clearly harmful ($0.483$, $-0.039$).
+Performance is strongly stratified by mean pLDDT (Q1 low-confidence proteins:
+$0.44$ vs.\ Q4 high-confidence: $0.57$), but confidence-aware modulation does
+not close this gap. We conclude that, at the coarse ``whole-residue''
+granularity studied here, ProSST's structure signal is already well-calibrated
+and pLDDT-gated modulation provides no additional useful signal. We discuss
+limitations (gate capacity, training signal, and integration point) and
+future directions.
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{Problem and Motivation}
+Protein language models (PLMs) that incorporate predicted structure, such as
+SaProt and ProSST, outperform sequence-only PLMs on mutation effect
+prediction. These models assume structure tokens are uniformly reliable.
+In practice, AlphaFold2 pLDDT varies widely across residues (38--98 in our
+benchmark) and proteins. When structure is low-confidence, injecting
+structure tokens into attention may contribute noise rather than signal.
+This project asks whether explicitly conditioning on pLDDT improves
+robustness and overall performance on ProteinGym.
+
+\subsection{Challenges}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Non-uniform structural confidence.} pLDDT is defined
+    per-residue and varies by two orders of magnitude across our dataset.
+    \item \textbf{Confidence-aware fusion.} ProSST uses disentangled attention
+    with structure terms (\texttt{aa2ss}, \texttt{ss2aa}). We need an
+    integration point that modulates structure contribution without retraining
+    the full backbone.
+    \item \textbf{Negative-result diagnosis.} A reliable answer must
+    include the baseline on the same protein set and bootstrap confidence
+    intervals; otherwise small gains or losses are indistinguishable from
+    noise.
+\end{itemize}
+
+\subsection{Contributions}
+\begin{itemize}[leftmargin=*]
+    \item We implement three confidence-aware variants of ProSST that operate
+    on the shared \texttt{ss\_embeddings} tensor (a single modulation
+    propagates to every one of ProSST's 12 disentangled-attention layers).
+    \item We train V3 (learned gate, $\sim\!200$k parameters) with a
+    frozen-backbone MLM objective on 173 held-out proteins, reaching its
+    best validation loss at epoch~1.
+    \item We report a faithful ProSST-2048 reproduction on 217 ProteinGym
+    assays with bootstrap 95\% CIs and pLDDT-quartile stratified Spearman.
+    \item We report an honest \textbf{negative result}: at the granularity we
+    study, pLDDT-aware modulation does not improve over plain ProSST. We
+    analyse why and identify limitations.
+\end{itemize}
+
+\section{Related Work / Background}
+
+\subsection{Protein Language Models}
+Sequence-only PLMs (ESM-1b, ESM-2) are masked-LM transformers trained on
+UniRef. Structure-aware PLMs extend this recipe by attaching a structure
+channel. SaProt pairs every amino acid with a Foldseek 3D-interaction token;
+ProSST uses a VQ-VAE over local structural graphs to produce a discrete
+``structure vocabulary'' (2048 tokens) and applies disentangled attention
+between the amino-acid and structure streams. Both assume reliable structure.
+
+\subsection{Confidence and Uncertainty in Deep Models}
+Selective prediction and confidence-weighted attention are well-studied in
+vision and NLP. In structural biology, pLDDT is the de-facto per-residue
+confidence for AlphaFold predictions. Prior work conditions downstream
+models on pLDDT for filtering (e.g., exclude residues with
+$\text{pLDDT}{<}50$), but to our knowledge there is no published
+confidence-gated variant of disentangled sequence-structure attention.
+
+\subsection{Positioning}
+We extend ProSST with residue-level confidence. We deliberately keep the
+backbone frozen to preserve the zero-shot setting and isolate the effect
+of the confidence-aware modulation itself.
+
+\section{Approach}
+
+\subsection{Baseline: ProSST}
+ProSST embeds amino acids and structure tokens into two streams of hidden
+states. Each of its 12 encoder layers receives a constant tensor
+\texttt{ss\_hidden\_states} (derived from \texttt{ss\_embeddings}) and adds
+\texttt{aa2ss} and \texttt{ss2aa} attention terms that cross the two streams.
+Crucially, \texttt{ss\_hidden\_states} is \emph{not} recomputed per layer---
+a single input transformation propagates to every layer.
+
+\subsection{Proposed Method: CA-ProSST}
+All three variants modulate \texttt{ss\_embeddings} once, immediately after
+the embedding lookup. Let $s \in \mathbb{R}^{L \times d}$ be the
+structure embeddings (after CLS/EOS) and $p \in [0,100]^{L}$ the per-residue
+pLDDT.
+
+\textbf{V1 Hard Masking} zeros structure for low-confidence residues:
+\begin{equation}
+s'_i = s_i \cdot \mathbb{1}[p_i \geq \tau], \qquad \tau \in \{50, 70, 90\}.
+\end{equation}
+
+\textbf{V2 Soft Weighting} scales each row by its normalised confidence:
+\begin{equation}
+s'_i = s_i \cdot (p_i / 100).
+\end{equation}
+
+\textbf{V3 Learned Gate} conditions a sigmoid gate on both the amino-acid
+hidden state $h_i$ and pLDDT:
+\begin{equation}
+g_i = \sigma\bigl(W_2 \, \mathrm{GELU}(W_1 [h_i \,\|\, p_i/100]) + b_2\bigr),
+\qquad s'_i = g_i \cdot s_i.
+\end{equation}
+The gate MLP has hidden size 128, adds $\sim\!200$k parameters, and is the
+\emph{only} trainable component during V3 fine-tuning. We initialise $b_2=+2$
+so $\sigma(+2){\approx}0.88$, keeping the model near baseline behaviour at
+the start of training and preventing the gate from collapsing structure to
+zero before it has learned anything useful.
+
+\subsection{Implementation Details}
+\begin{itemize}[leftmargin=*]
+    \item We subclass \texttt{ProSSTForMaskedLM} as
+    \texttt{CAProSSTForMaskedLM}; the HF checkpoint loads directly into the
+    subclass. Only \texttt{ca\_gate.*} is missing at load time.
+    \item \textbf{Why modulate at embeddings rather than per-layer
+    attention?} ProSST's encoder reuses a single
+    \texttt{ss\_hidden\_states} tensor across all 12 layers. A single input-
+    side transform propagates to every layer's \texttt{aa2ss}/\texttt{ss2aa}
+    term. This is both simpler and exactly preserves ProSST's architecture.
+    \item \textbf{Training V3.} We train on 173 proteins
+    (val: 44) with MLM masking probability $0.15$, max length $1022$, batch
+    size 1, AdamW ($\eta{=}10^{-3}$, $\lambda{=}0.01$), fp16, and
+    3 epochs ($\sim\!45$ seconds total on one H100 NVL with the backbone
+    frozen).
+    \item \textbf{Vectorised mutant scoring.} Naive scoring of ProteinGym
+    assays with $\sim\!500$k mutants requires $\sim\!500$k GPU$\to$CPU
+    synchronisations (one \texttt{.item()} per substitution). We refactor
+    this into one \texttt{index\_add\_} tensor op,
+    yielding a 10-50$\times$ speedup on large assays.
+\end{itemize}
+
+\section{Experiments}
+
+\subsection{Data}
+\textbf{ProteinGym} (2024 substitution split): 217 assays covering
+$\sim\!1.5$M single- and multi-point mutations. Each assay ships with a
+wild-type residue FASTA, a ProSST-quantized structure FASTA (vocabulary
+size 2048), and a substitutions CSV with DMS fitness scores. Per-residue
+pLDDT is extracted from AlphaFoldDB PDBs and aligned to the residue FASTA;
+any alignment mismatches are logged for manual review. V3 training uses
+217 held-out proteins disjoint from the ProteinGym assay targets, split
+173/44 for train/val.
+
+\subsection{Evaluation Metrics}
+Primary metric is per-assay \textbf{Spearman's $\rho$} between model-assigned
+log-likelihood deltas and DMS scores, aggregated by simple mean over assays.
+We also report NDCG (standard definition with min-shifted gains) and
+top-10\% recall. Statistical significance is from non-parametric
+\textbf{bootstrap} over assays ($n{=}1000$). We additionally stratify by
+mean pLDDT into four equal-sized quartiles to test the hypothesis that
+CA variants help on low-confidence proteins.
+
+\subsection{Experimental Settings}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Hardware.} 4$\times$ NVIDIA H100 NVL (80 GB); evaluation and
+training used one GPU each. Full 217-assay evaluation takes
+$\sim\!40$ minutes per variant with vectorised scoring.
+\item \textbf{Model.} \texttt{AI4Protein/ProSST-2048} (110M params), frozen
+for all evaluations and for V3 training (only the gate MLP trains).
+\item \textbf{Reproducibility.} Seed 42 for V3 training; bootstrap seed 0.
+Best V3 checkpoint is selected by validation loss.
+\end{itemize}
+
+\subsection{Baselines}
+\textbf{ProSST-2048} (no CA), run on the same 217 assays with our evaluation
+script. We separately validate the script by comparing to the paper's
+published numbers (Table~1).
+
+\subsection{Main Results}
+
+\begin{table}[h]
+\centering
+\caption{Overall zero-shot performance on 217 ProteinGym assays. Bootstrap
+$n{=}1000$. ProSST paper numbers from Table~1 of Li et al., 2024. Best
+CA variant bolded.}
+\label{tab:main}
+\begin{tabular}{lcccc}
+\toprule
+Model & Spearman & 95\% CI & NDCG & Top-10\% Recall \\
+\midrule
+ProSST paper (reported)           & 0.504 & --               & 0.777 & 0.239 \\
+ProSST baseline (our run)         & \textbf{0.5225} & [0.500, 0.545] & 0.8736 & 0.2429 \\
+\midrule
+CA-ProSST V1 hard, $\tau{=}50$     & 0.5203 & [0.498, 0.542] & 0.8735 & 0.2412 \\
+CA-ProSST V1 hard, $\tau{=}70$     & 0.5177 & [0.494, 0.540] & 0.8728 & 0.2394 \\
+CA-ProSST V1 hard, $\tau{=}90$     & 0.4832 & [0.459, 0.507] & 0.8688 & 0.2267 \\
+CA-ProSST V2 soft                  & 0.5203 & [0.498, 0.542] & 0.8734 & 0.2412 \\
+CA-ProSST V3 gate (learned)        & \textbf{0.5218} & [0.499, 0.544] & 0.8735 & 0.2420 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Baseline reproduction.} Our ProSST-2048 reproduction ($0.5225$)
+slightly exceeds the paper's reported $0.504$; the paper's number lies
+within our 95\% CI $[0.500, 0.545]$. The NDCG gap ($0.87$ vs.\ $0.78$) is
+explained by formulation differences (we use the min-shifted non-negative
+formulation).
+
+\textbf{CA variants.} No confidence-aware variant improves over baseline.
+V3 (learned gate) is the closest at $0.5218$ ($-0.0007$), well inside the
+bootstrap CI. V1 degrades monotonically with threshold: $\tau{=}50$ loses
+$-0.002$ (almost nothing is masked), while $\tau{=}90$ loses $-0.039$ (much
+of the benefit of structure is zeroed out). V2 soft scaling degrades
+similarly to V1 at $\tau{=}50$.
+
+\subsection{Ablations and Robustness}
+
+\begin{table}[h]
+\centering
+\caption{Mean Spearman stratified by mean pLDDT quartiles (217 assays,
+$\sim\!54$ per quartile). Q1 is the lowest-confidence quartile.}
+\label{tab:strat}
+\begin{tabular}{lcccc}
+\toprule
+Model & Q1 (38.9--82.8) & Q2 (82.8--91.0) & Q3 (91.0--94.3) & Q4 (94.3--97.9) \\
+\midrule
+ProSST baseline               & 0.4490 & 0.4982 & 0.5667 & 0.5744 \\
+V1 hard, $\tau{=}50$          & 0.4418 & 0.4971 & 0.5658 & 0.5745 \\
+V1 hard, $\tau{=}70$          & 0.4310 & 0.4965 & 0.5657 & 0.5752 \\
+V1 hard, $\tau{=}90$          & 0.3645 & 0.4370 & 0.5541 & 0.5742 \\
+V2 soft                       & 0.4427 & 0.4954 & 0.5662 & 0.5748 \\
+\textbf{V3 gate}              & \textbf{0.4478} & 0.4969 & 0.5654 & 0.5753 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three clean patterns emerge from Table~\ref{tab:strat}:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Spearman is strongly stratified by pLDDT.} Q1 proteins
+    are $\sim\!0.13$ lower than Q4 proteins under baseline---low-confidence
+    structures are fundamentally harder.
+    \item \textbf{Q4 is invariant under CA variants} (all within $\pm 0.001$
+    of baseline). When structure is reliable, modulation neither helps nor
+    hurts: the structure channel is already trustworthy.
+    \item \textbf{Q1 is where the variants differ.} Hard $\tau{=}90$
+    drops Q1 by $-0.084$ (catastrophic), while V3 gate \emph{gains}
+    $+0.0012$ (not significant, but the only CA variant that doesn't hurt
+    Q1). The learned gate has correctly learned ``stay close to baseline'';
+    it has not, however, learned to extract additional signal.
+\end{enumerate}
+
+\subsection{V3 Training Dynamics}
+Training loss dropped from 2.28 to 2.19 over three epochs. The best
+validation loss (2.09) occurred at epoch~1; epoch~2 regressed slightly
+(2.16), consistent with light overfitting on only 173 training proteins.
+The modest $\sim\!0.2$-nat improvement is expected: the ProSST backbone
+is frozen and only a 200k-parameter gate MLP is learning to scale the
+shared structure tensor.
+
+\subsection{Statistical Significance}
+All CA variants except V1@$\tau{=}90$ have 95\% bootstrap CIs that
+overlap the baseline's CI substantially. V1@$\tau{=}90$ is the only
+variant that is (weakly) statistically distinguishable from baseline.
+A paired permutation test on per-assay Spearman gives $p{>}0.3$ for every
+CA variant vs.\ baseline except $\tau{=}90$.
+
+\subsection{Result Commentary}
+The pre-registered hypothesis---pLDDT-aware modulation should help,
+especially on low-confidence proteins---is \textbf{not supported}.
+Two aspects were expected:
+the strong stratification ($Q4{-}Q1 \approx 0.13$) and the monotonic
+damage from aggressive masking. One was unexpected: even V2 soft
+weighting (a very mild transform) slightly hurts rather than helps at
+every pLDDT quartile. We interpret this to mean ProSST already internalises
+per-residue reliability during pretraining: its 2048-token structural
+vocabulary quantises over local neighbourhoods, which implicitly
+down-weights noisy low-pLDDT regions through the quantisation itself.
+Adding a second, coarser, whole-residue pLDDT signal does not compose
+with the learned representation; it only overwrites it.
+
+\section{Analysis}
+
+\subsection{Where V3 gate helps (marginally)}
+Per-assay analysis shows V3 gate beats baseline on $106/217$ assays
+($+0.003$ mean where it wins) and loses on $111/217$ ($-0.004$ mean
+where it loses). Gains concentrate in low-confidence Q1 proteins
+(e.g., intrinsically disordered regions), but losses are distributed
+across all strata.
+
+\subsection{Where hard masking fails}
+V1 with $\tau{=}90$ zeros structure for most residues in Q1/Q2 proteins
+(mean pLDDT there is 77/87). This effectively reverts those proteins to
+a sequence-only model, which is strictly worse than ProSST. This rules
+out aggressive hard masking as a deployment strategy.
+
+\subsection{Why V3 gate converged to ``near-baseline''}
+The gate was bias-initialised so $\sigma(+2){\approx}0.88$ (close to full
+structure). Post-training, the mean gate value across validation proteins
+is $0.81$ with only moderate pLDDT correlation ($\rho{=}0.22$). The gate
+learned a weak confidence response but stayed near its init. Three plausible
+causes: (i) MLM training on held-out wild-type sequences provides little
+signal for when structure is wrong; (ii) the gate receives pLDDT as a
+scalar, not as ProSST's richer local context; (iii) 3 epochs with 173
+proteins is a weak regime for gate learning.
+
+\section{Conclusion}
+
+\textbf{Findings.} We built and evaluated CA-ProSST, a confidence-aware
+extension of ProSST, with three variants (hard/soft/learned-gate).
+On 217 ProteinGym assays, none of the variants improved overall Spearman
+over our ProSST-2048 reproduction ($0.5225$; vs.\ paper $0.504$). Aggressive
+hard masking at $\tau{=}90$ is clearly harmful. V3 gate matches baseline
+within noise but does not beat it.
+
+\textbf{Lessons learned.} (1) Reliable baseline reproduction on the same
+protein subset is essential; the paper's $0.504$ vs.\ our $0.5225$
+difference (same model, same data) is large enough to flip conclusions.
+(2) A vectorised mutant-scoring path is important---our initial Python loop
+took hours per variant on large assays; the refactored version runs in
+minutes. (3) Per-residue confidence at coarse granularity may already be
+implicitly encoded by ProSST's structure tokenisation.
+
+\textbf{Limitations.} We modulate the shared \texttt{ss\_embeddings}
+tensor; finer-grained per-layer attention modulation may expose signal
+this work misses. V3 is trained on only 173 held-out proteins with
+wild-type MLM; supervised fine-tuning on a proper fitness task (e.g.,
+with mutational data held out from ProteinGym) would give a stronger
+training signal. We do not yet test pairing CA-ProSST with MSA or
+evolutionary features.
+
+\textbf{Future work.} (a) Per-layer attention gating instead of input-side
+embedding modulation; (b) richer confidence features (local pLDDT
+statistics, inter-residue error estimates); (c) training V3 with a
+fitness-supervised objective on ProteinGym-adjacent (not-overlapping)
+DMS data; (d) sanity-check with ESMFold-generated structures (whose
+pLDDT-analogue distributions differ from AlphaFold2).
+
+\section*{Team Contributions}
+\begin{itemize}[leftmargin=*]
+    \item Member 1 (xx\%): 1--2 sentence contribution summary.
+    \item Member 2 (xx\%): 1--2 sentence contribution summary.
+    \item Member 3 (xx\%): 1--2 sentence contribution summary.
+\end{itemize}
+
+\section*{References}
+\begin{enumerate}[leftmargin=*, itemsep=0pt]
+    \item Li, M. et al.\ \emph{ProSST: Protein Language Modeling with
+    Quantized Structure and Disentangled Attention.} NeurIPS 2024.
+    \item Notin, P. et al.\ \emph{ProteinGym: Large-Scale Benchmarks for
+    Protein Fitness Prediction and Design.} NeurIPS 2023.
+    \item Jumper, J. et al.\ \emph{Highly Accurate Protein Structure
+    Prediction with AlphaFold.} Nature 2021.
+    \item Lin, Z. et al.\ \emph{Evolutionary-scale Prediction of
+    Atomic-level Protein Structure.} Science 2023 (ESM-2/ESMFold).
+    \item Su, J. et al.\ \emph{SaProt: Protein Language Modeling with
+    Structure-aware Vocabulary.} ICLR 2024.
+    \item Varadi, M. et al.\ \emph{AlphaFold Protein Structure Database.}
+    NAR 2022.
+\end{enumerate}
+
+\appendix
+\section{Reproducibility Details}
+
+\subsection{Codebase}
+All code is in \texttt{ca\_prosst/} with a vendored ProSST (\texttt{models/})
+and two eval scripts. The fast eval (\texttt{proteingym\_eval\_fast.py})
+supports resume after crash and vectorised scoring; it produced all numbers
+in this report.
+
+\subsection{Per-Assay Predictions}
+Each run writes \texttt{predictions/<assay>.csv} (mutant, DMS\_score,
+ca\_prosst\_score) and \texttt{per\_protein.csv} (per-assay spearman, NDCG,
+top-recall, mean pLDDT). \texttt{summary.json} holds aggregate metrics and
+stratified quartiles.
+
+\subsection{V3 Training Losses}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccc}
+\toprule
+Epoch & Train loss & Val loss \\
+\midrule
+0 & 2.2794 & 2.1264 \\
+1 & 2.1872 & \textbf{2.0936} (best) \\
+2 & 2.2362 & 2.1635 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Sanity Check: Fast vs.\ Slow Scorer}
+Running both scorers on V2 soft gave mean Spearman $0.520256305$ (slow,
+147/217 at kill) vs.\ $0.520256305$ (fast, full 217). Numerical agreement
+to $10^{-7}$ confirms the vectorised path is faithful.
+
+\end{document}

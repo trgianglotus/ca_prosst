@@ -1,0 +1,14 @@
+{
+  "ca_mode": "none",
+  "ca_threshold": 70.0,
+  "n_proteins": 142,
+  "mean_spearman": 0.5366611923517113,
+  "median_spearman": 0.5495434917286459,
+  "spearman_95ci": [
+    0.5087791218038271,
+    0.5625125392524499
+  ],
+  "mean_ndcg": 0.8916984039352236,
+  "mean_top_recall_10pct": 0.2495767156990617,
+  "stratified_by_plddt": {}
+}

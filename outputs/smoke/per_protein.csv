@@ -1,0 +1,2 @@
+name,n_mutants,spearman,ndcg,top_recall_10pct,mean_plddt
+A0A140D2T1_ZIKV_Sourisseau_2019,9576,0.27971548195030527,0.2565605838810313,0.1315240083507307,
